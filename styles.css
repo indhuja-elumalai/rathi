@@ -79,3 +79,11 @@ footer { text-align: center; color: var(--mut); font-size: 12px; padding: 16px; 
 .vsw { display: flex; border: 1px solid var(--line); border-radius: 999px; padding: 3px; gap: 2px; }
 .vsw button { border: 0; background: transparent; color: var(--mut); padding: 6px 14px; border-radius: 999px; font: inherit; font-weight: 700; cursor: pointer; }
 .vsw button.active { background: var(--yel); color: #3a2a00; }
+.r-model { background: #e5ddff; color: #3d2a8c; }
+h4.sub { margin: 12px 0 6px; font-size: 12px; text-transform: uppercase; letter-spacing: .5px; color: var(--blue2); }
+table.hyp td { font-size: 12.5px; }
+.verdict { display: inline-block; font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
+.v-sup { background: #d7f2e4; color: #0f5a39; } .v-out { background: #e8edf3; color: #42536a; }
+.v-cant { background: #fff1c2; color: #6b4d00; } .v-mix { background: #fde2df; color: #8c2b20; }
+ul.mem { margin: 0 0 4px; padding-left: 18px; font-size: 13px; }
+.wi { display: flex; flex-wrap: wrap; gap: 6px; }

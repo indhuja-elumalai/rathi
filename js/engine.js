@@ -7,6 +7,7 @@ import { DAYS } from './sim.js';
 const SIGNALS = {
   // EV
   batteryTemp: { label: 'Battery temperature', unit: '°C', vss: 'Vehicle.Powertrain.TractionBattery.Temperature.Average' },
+  batteryTemp2: { label: 'Battery temperature (2nd sensor)', unit: '°C', vss: 'Vehicle.Powertrain.TractionBattery.Temperature.Max (2nd sensor)', redundant: true },
   pumpDuty: { label: 'Battery coolant pump duty', unit: '%', vss: 'Vehicle.Powertrain.TractionBattery.CoolantPump.Duty (extension)' },
   chargePower: { label: 'Charging power', unit: 'kW', vss: 'Vehicle.Powertrain.TractionBattery.Charging (derived power)' },
   cellDelta: { label: 'Cell voltage spread', unit: 'mV', vss: 'Vehicle.Powertrain.TractionBattery.CellVoltage (derived)' },
@@ -25,7 +26,7 @@ const SIGNALS = {
 };
 
 // Minimum spread per signal (sensor resolution), so tiny noise is never reported as a large deviation
-const MIN_SD = { batteryTemp: 1, pumpDuty: 5, chargePower: 2, cellDelta: 2, coolantTemp: 1, fanDuty: 5, engineLoad: 4, oilTemp: 1.5,
+const MIN_SD = { batteryTemp: 1, batteryTemp2: 1, pumpDuty: 5, chargePower: 2, cellDelta: 2, coolantTemp: 1, fanDuty: 5, engineLoad: 4, oilTemp: 1.5,
   amb: 1, tireAmb: 1, tireFL: 0.03, tireFR: 0.03, tireRL: 0.03, tireRR: 0.03 };
 
 const fmtDay = (t) => new Date(t).toLocaleDateString('en-IN', { weekday: 'short', day: 'numeric', month: 'short' });
@@ -36,7 +37,10 @@ const r1 = (x) => Math.round(x * 10) / 10;
 const inR = (label) => (label === 'yesterday' || label === 'today' ? label : `in the ${label}`);
 
 // ---------- Router: intent + time slots, no LLM ----------
+const LEADING = /(prove|confirm that|show that|it was the|was caused by the|blame)/;
 const RULES = [
+  { id: 'what_if', test: (q) => /(what if|what would|would (it|the warning)|suppose|if i had|if charging|if engine)/.test(q) },
+  { id: 'before_warning', test: (q) => LEADING.test(q) && /(caus|overheat|warning|fault)/.test(q) },
   { id: 'before_warning', test: (q) => /(before|pehle|पहले|cause|why|kyun|क्यों|explain|what happened)/.test(q) && /(warning|overheat|over-temp|temperature|coolant|engine|tpms|tyre|tire|pressure|chetavani|चेतावनी|बैटरी|इंजन|गरम|battery)/.test(q) },
   { id: 'eff_drop', test: (q) => /(efficien|consumption|economy|mileage|wh\/km|l\/100)/.test(q) && /(drop|largest|worst|lowest|biggest|fell)/.test(q) },
   { id: 'range_trend', test: (q) => /(range|रेंज)/.test(q) },
@@ -95,7 +99,7 @@ function fitEfficiencyModel(trips) {
 const wMean = (trips, fn) => { const km = trips.reduce((s, t) => s + t.km, 0); return trips.reduce((s, t) => s + fn(t) * t.km, 0) / (km || 1); };
 
 export function buildEngine(data) {
-  const { profile: P, trips, warnings, adas, baseline, dayStart } = data;
+  const { profile: P, trips, warnings, adas, baseline, dayStart, similar = [] } = data;
   const U = P.unit;
   const rp = (x) => +x.toFixed(P.dp);
   const effOf = (ts) => { const km = ts.reduce((s, t) => s + t.km, 0); return km ? (ts.reduce((s, t) => s + t.energy, 0) / km) * P.perKm : NaN; };
@@ -210,7 +214,7 @@ export function buildEngine(data) {
     unknown() {
       return {
         route: 'abstain', confidence: '-',
-        text: "I can't answer that from this vehicle's data, so I won't guess. I can explain range and efficiency changes, compare city and highway driving, list warnings and ADAS disengagements, and show what happened before any warning.",
+        text: "I can't answer that from this vehicle's data, so I won't guess. I can explain range and efficiency changes, compare city and highway driving, list warnings and ADAS disengagements, show what happened before any warning, and replay an incident with one factor changed (what-if).",
         facts: { abstained: true },
       };
     },
@@ -224,7 +228,7 @@ export function buildEngine(data) {
         evidence: [['Warning log', w.code]], facts: { warningCode: w.code, abstained: true },
       };
     }
-    const ranked = Object.entries(w.snapshot).map(([key, pts]) => {
+    const ranked = Object.entries(w.snapshot).filter(([key]) => !SIGNALS[key].redundant).map(([key, pts]) => {
       const base = baseline[key] || [];
       const m = mean(base), s = Math.max(sd(base), MIN_SD[key] || 0);
       const peak = pts.reduce((p, c) => (Math.abs(c[1] - m) > Math.abs(p[1] - m) ? c : p));
@@ -250,6 +254,152 @@ export function buildEngine(data) {
     };
   }
 
+  // ---------- Evidence Lab: competing explanations with supporting and contradicting evidence ----------
+  const OH = P.overheat || {};
+  const fl = (v) => (OH.loadUnit === '%' ? `${v}%` : `${v} ${OH.loadUnit}`);
+  const zOf = (key, v) => { const base = baseline[key] || []; return base.length ? (v - mean(base)) / Math.max(sd(base), MIN_SD[key] || 0) : NaN; };
+  const peakOf = (pts) => pts.reduce((m, p) => (p[1] > m[1] ? p : m));
+
+  function investigate(w, opts = {}) {
+    const K = OH.keys, snap = { ...w.snapshot };
+    for (const k of opts.drop || []) delete snap[k];
+    if (opts.conflict && snap[K.temp2]) snap[K.temp2] = snap[K.temp2].map(([t]) => [t, snap[K.temp2][0][1]]);
+    const T = snap[K.temp], T2 = snap[K.temp2], U = snap[K.cool], L = snap[K.load], A = snap.amb;
+    const rise = T.at(-1)[1] - T[0][1];
+    const H = {
+      load: { label: `High ${OH.loadName}`, sup: [], con: [] },
+      ambient: { label: 'Hot weather', sup: [], con: [] },
+      coolingLimit: { label: 'Cooling at its limit', sup: [], con: [] },
+      coolingFault: { label: `${OH.coolName[0].toUpperCase() + OH.coolName.slice(1)} hardware fault`, sup: [], con: [], missing: [] },
+      sensor: { label: 'Temperature sensor fault', sup: [], con: [], missing: [] },
+    };
+    if (L) {
+      const lp = peakOf(L)[1], z = zOf(K.load, lp);
+      (z >= 2 ? H.load.sup : z < 1 ? H.load.con : []).push(`${OH.loadName} ${fl(lp)} (${z.toFixed(1)}σ vs this car's normal)`);
+    } else H.load.missing = [`${OH.loadName} not recorded`];
+    if (A) {
+      const a = mean(A.map((p) => p[1])), z = zOf('amb', a);
+      (z >= 1.5 ? H.ambient.sup : z < 0.5 ? H.ambient.con : []).push(`outside ${r1(a)} °C (${z.toFixed(1)}σ)`);
+    } else H.ambient.missing = ['outside temperature not recorded'];
+    if (U) {
+      const sat = U.find((p) => p[1] >= 98);
+      if (sat) {
+        const mins = Math.round((w.t - sat[0]) / 60000), after = T.find((p) => p[0] >= sat[0]);
+        H.coolingLimit.sup.push(`${OH.coolName} at 100% from ${mins} min before the warning, temperature still rose ${r1(T.at(-1)[1] - after[1])} °C`);
+      } else H.coolingLimit.con.push(`${OH.coolName} never exceeded ${Math.max(...U.map((p) => p[1]))}%: cooling had headroom`);
+      H.coolingFault.con.push(`${OH.coolName} responded to temperature as commanded`);
+      H.coolingFault.missing.push('coolant flow is not recorded');
+    } else {
+      H.coolingLimit.missing = [`${OH.coolName} duty not recorded`];
+      H.coolingFault.missing.push(`${OH.coolName} duty and coolant flow not recorded`);
+    }
+    if (T2) {
+      const rise2 = T2.at(-1)[1] - T2[0][1];
+      if (rise2 >= 0.6 * rise) H.sensor.con.push(`an independent sensor rose with it, +${r1(rise2)} vs +${r1(rise)} °C`);
+      else H.sensor.sup.push(`the independent sensor stayed flat, +${r1(rise2)} vs +${r1(rise)} °C`);
+    } else H.sensor.missing.push('no second temperature sensor recorded');
+
+    for (const h of Object.values(H)) {
+      const s = h.sup.length, c = h.con.length, m = (h.missing || []).length;
+      h.verdict = s && !c ? 'supported' : c && !s ? (m && h === H.coolingFault ? 'cannot verify' : 'ruled out') : s && c ? 'mixed' : 'cannot verify';
+    }
+    if (H.coolingFault.missing.length) H.coolingFault.verdict = 'cannot verify';
+    const order = ['load', 'coolingLimit', 'ambient', 'sensor', 'coolingFault'];
+    const supported = order.filter((k) => H[k].verdict === 'supported');
+    const confidence = H.sensor.verdict === 'supported' ? 'Low' : supported.length && H.sensor.verdict === 'ruled out' ? 'High' : 'Medium';
+    const top = supported[0] || null;
+    return { H, order, supported, top, confidence, rise };
+  }
+
+  // ---------- What-if Lab: replay the recorded incident through a heat model fitted to it ----------
+  function fitThermal(w) {
+    const K = OH.keys, s = w.snapshot, T = s[K.temp], U = s[K.cool], L = s[K.load], A = s.amb, n = T.length - 1;
+    let a11 = 0, a12 = 0, a22 = 0, b1 = 0, b2 = 0;
+    for (let i = 0; i < n; i++) {
+      const dt = (T[i + 1][0] - T[i][0]) / 1000, y = (T[i + 1][1] - T[i][1]) / dt;
+      const x1 = L[i][1], x2 = -(U[i][1] / 100) * (T[i][1] - A[i][1]);
+      a11 += x1 * x1; a12 += x1 * x2; a22 += x2 * x2; b1 += x1 * y; b2 += x2 * y;
+    }
+    const det = a11 * a22 - a12 * a12, a = (b1 * a22 - b2 * a12) / det, b = (a11 * b2 - a12 * b1) / det;
+    // cooling controller: linear fit of duty vs temperature on unsaturated samples
+    const pts = U.map((u, i) => [T[i][1], u[1]]).filter(([, u]) => u < 98 && u > Math.min(...U.map((x) => x[1])) + 0.5);
+    const mt = mean(pts.map((p) => p[0])), mu = mean(pts.map((p) => p[1]));
+    const k = pts.reduce((acc, p) => acc + (p[0] - mt) * (p[1] - mu), 0) / (pts.reduce((acc, p) => acc + (p[0] - mt) ** 2, 0) || 1);
+    return { a, b, k, mt, mu, umin: Math.min(...U.map((x) => x[1])) };
+  }
+  function replay(w, m, change = {}) {
+    const K = OH.keys, s = w.snapshot, T = s[K.temp];
+    let temp = T[0][1]; const out = [];
+    for (let i = 0; i < T.length; i++) {
+      const t = T[i][0], recL = s[K.load][i][1];
+      const L = change.load != null ? Math.min(recL, change.load) : recL;
+      const amb = change.amb != null ? change.amb : s.amb[i][1];
+      const u = change.fullCooling ? 100 : Math.min(100, Math.max(m.umin, m.mu + m.k * (temp - m.mt)));
+      out.push([t, r1(temp)]);
+      if (i < T.length - 1) temp += ((T[i + 1][0] - t) / 1000) * (m.a * L - m.b * (u / 100) * (temp - amb));
+    }
+    return out;
+  }
+  function whatIf(w, change, labelText) {
+    const t0 = performance.now();
+    const K = OH.keys, T = w.snapshot[K.temp], m = fitThermal(w);
+    const base = replay(w, m), cf = replay(w, m, change);
+    const rmse = Math.sqrt(mean(base.map((p, i) => (p[1] - T[i][1]) ** 2)));
+    const recPeak = peakOf(T)[1], cfPeak = peakOf(cf)[1], cross = cf.find((p) => p[1] >= w.threshold);
+    const verdict = cross ? `the warning would still trigger, ${Math.round((w.t - cross[0]) / 60000)} min earlier than recorded` .replace(/, 0 min earlier than recorded/, ' at about the same time') : `the warning would not trigger (peak stays ${r1(w.threshold - cfPeak)} °C below the ${w.threshold} °C threshold)`;
+    return {
+      route: 'model', confidence: rmse < 1 ? 'High' : 'Medium', intent: 'what_if', question: labelText, range: null,
+      text: `What-if: ${labelText.replace(/^What if /i, '').replace(/\?$/, '')}. Replaying the recorded ${w.label.toLowerCase()} incident through a heat model fitted to it (fit error ${rmse.toFixed(2)} °C): recorded peak ${recPeak} °C → simulated peak ${cfPeak} °C, so ${verdict}. This is a model estimate, not proof of the physical cause.`,
+      chart: { type: 'line', unitL: '°C', marker: w.t, markerLabel: 'warning', series: [
+        { name: 'Recorded', color: '#0b5cad', points: T },
+        { name: 'What-if (model)', color: '#f2b705', points: cf },
+        { name: 'Warning threshold', color: '#c0392b', points: [[T[0][0], w.threshold], [T.at(-1)[0], w.threshold]] },
+      ] },
+      evidence: [[SIGNALS[K.temp].vss, SIGNALS[K.temp].label], [SIGNALS[K.load].vss, SIGNALS[K.load].label], [SIGNALS[K.cool].vss, SIGNALS[K.cool].label], ['Vehicle.Exterior.AirTemperature', 'Outside temperature']],
+      facts: { recordedPeak: recPeak, cfPeak, cfWarn: !!cross, fitRmse: rmse },
+      ms: performance.now() - t0,
+    };
+  }
+  const SCENARIOS = () => [
+    { id: 'load', label: `What if ${OH.loadName} had been capped at ${fl(OH.cfLoad)}?`, change: { load: OH.cfLoad } },
+    { id: 'amb', label: 'What if it had been 28 °C outside?', change: { amb: 28 } },
+    { id: 'cool', label: `What if the ${OH.coolName} had run at 100% from the start?`, change: { fullCooling: true } },
+  ];
+
+  function investigateAnswer(w, opts = {}, leadingClaim = null) {
+    const r = investigate(w, opts), K = OH.keys, H = r.H;
+    const base = beforeWarning(w);
+    const near = similar.map((x) => `${fmtDay(x.t)}: ${x.peak} °C at ${fl(x.load)}, ${x.amb} °C outside, no warning`);
+    const cf = whatIf(w, { load: OH.cfLoad }, `What if ${OH.loadName} had been capped at ${fl(OH.cfLoad)}?`);
+    const sup = r.supported.map((k) => H[k].label.toLowerCase());
+    const ruled = r.order.filter((k) => H[k].verdict === 'ruled out').map((k) => `${H[k].label.toLowerCase()}, because ${H[k].con[0]}`);
+    const cant = r.order.filter((k) => H[k].verdict === 'cannot verify').map((k) => `${H[k].label.toLowerCase()}, because ${(H[k].missing || [])[0] || 'there is no evidence either way'}`);
+    let lead = '';
+    if (leadingClaim) {
+      const h = H[leadingClaim];
+      lead = h.verdict === 'supported' ? `The data supports this: ${h.sup[0]}. ` : h.verdict === 'ruled out' ? `The data contradicts that: ${h.con[0]}. ` : `I can't confirm that from the data: a ${h.label.toLowerCase()} cannot be verified because ${(h.missing || [])[0] || 'there is no evidence either way'}. `;
+    }
+    return {
+      ...base, route: 'investigate', confidence: r.confidence,
+      text: `${lead}${w.label} on ${fmtDay(w.t)} at ${fmtTime(w.t)} (${w.context}). Most supported: ${sup.join(', ') || 'none of the explanations'}.${ruled.length ? ` Ruled out: ${ruled.join('; ')}.` : ''}${cant.length ? ` Cannot verify: ${cant.join('; ')}.` : ''}${near.length ? ` Seen before: ${near.length} similar episodes stayed below the threshold.` : ''} What-if: at ${fl(OH.cfLoad)} the model peak is ${cf.facts.cfPeak} °C, so ${cf.facts.cfWarn ? 'the warning would still trigger' : 'the warning would not trigger'}.`,
+      hypotheses: r.order.map((k) => ({ key: k, label: H[k].label, verdict: H[k].verdict, sup: H[k].sup, con: H[k].con, missing: H[k].missing || [] })),
+      similar: near,
+      whatif: { warning: w.id, scenarios: SCENARIOS().map(({ id, label }) => ({ id, label })) },
+      facts: { ...base.facts, topHypothesis: r.top, verdicts: Object.fromEntries(r.order.map((k) => [k, H[k].verdict])), similarCount: similar.length,
+        leadingRejected: leadingClaim ? H[leadingClaim].verdict !== 'supported' : undefined, cfPeak: cf.facts.cfPeak, cfWarn: cf.facts.cfWarn },
+    };
+  }
+
+  function whatIfFromQuestion(q) {
+    const w = warnings.find((x) => x.kind === 'overheat');
+    const num = q.match(/(\d+(?:\.\d+)?)\s*(kw|%|percent)/);
+    const temp = q.match(/(\d+(?:\.\d+)?)\s*°?\s*c\b/);
+    if (/(full|100%) (cooling|pump|fan)|(pump|fan|cooling).{0,20}(full|100%)/.test(q)) return whatIf(w, { fullCooling: true }, `What if the ${OH.coolName} had run at 100% from the start?`);
+    if (temp && !num) return whatIf(w, { amb: +temp[1] }, `What if it had been ${temp[1]} °C outside?`);
+    if (num) return whatIf(w, { load: +num[1] }, `What if ${OH.loadName} had been capped at ${fl(num[1])}?`);
+    return whatIf(w, { load: OH.cfLoad }, `What if ${OH.loadName} had been capped at ${fl(OH.cfLoad)}?`);
+  }
+
   function findWarning(q) {
     if (/(tyre|tire|tpms|pressure)/.test(q)) return warnings.find((w) => w.kind === 'tpms');
     if (/(12 ?v|low voltage)/.test(q)) return warnings.find((w) => w.kind === 'lv');
@@ -260,14 +410,21 @@ export function buildEngine(data) {
   function ask(question) {
     const t0 = performance.now();
     const r = route(question);
-    const a = r.intent === 'before_warning' ? beforeWarning(findWarning(r.q)) : answers[r.intent](r.range);
-    return { ...a, intent: r.intent, range: r.intent === 'before_warning' || r.intent === 'unknown' ? null : r.range, question, ms: performance.now() - t0 };
+    let a;
+    if (r.intent === 'what_if') a = whatIfFromQuestion(r.q);
+    else if (r.intent === 'before_warning') {
+      const w = findWarning(r.q);
+      const claim = LEADING.test(r.q) ? (/(sensor)/.test(r.q) ? 'sensor' : /(pump|fan|cooling|radiator)/.test(r.q) ? 'coolingFault' : /(charg|load)/.test(r.q) ? 'load' : /(weather|heat|hot)/.test(r.q) ? 'ambient' : null) : null;
+      a = w.kind === 'overheat' ? investigateAnswer(w, {}, claim) : beforeWarning(w);
+    } else a = answers[r.intent](r.range);
+    return { ...a, intent: r.intent, range: ['before_warning', 'unknown', 'what_if'].includes(r.intent) ? null : r.range, question, ms: performance.now() - t0 };
   }
 
   function explain(id) {
     const t0 = performance.now();
     const w = warnings.find((x) => x.id === id);
-    return { ...beforeWarning(w), intent: 'before_warning', question: `Explain: ${w.label}`, ms: performance.now() - t0 };
+    const a = w.kind === 'overheat' ? investigateAnswer(w) : beforeWarning(w);
+    return { ...a, intent: 'before_warning', question: `Explain: ${w.label}`, ms: performance.now() - t0 };
   }
 
   function insights() {
@@ -287,7 +444,9 @@ export function buildEngine(data) {
     trips: trips.length, warnings: warnings.length,
   });
 
-  return { ask, explain, insights, status, warnings, profile: P };
+  const runWhatIf = (id, scen) => { const w = warnings.find((x) => x.id === id); const sc = SCENARIOS().find((x) => x.id === scen); return whatIf(w, sc.change, sc.label); };
+  const investigateWith = (opts) => investigateAnswer(warnings.find((x) => x.kind === 'overheat'), opts);
+  return { ask, explain, insights, status, warnings, profile: P, runWhatIf, investigateWith };
 }
 
 function mode(arr) {
@@ -304,6 +463,17 @@ export function benchmarkCases(GT) {
     { q: 'Show all ADAS disengagement events from yesterday.', intent: 'adas', check: (a) => a.facts.count === GT.adasYesterday },
     { q: 'ADAS disengagements in the last week', intent: 'adas', check: (a) => a.facts.count === GT.adasLast7 },
     { q: GT.overheatQ, intent: 'before_warning', check: (a) => a.facts.warningCode === GT.overheatCode && a.facts.topSignal === GT.overheatTop },
+    // Evidence Lab: competing explanations checked against the injected cause
+    { q: `${GT.overheatQ} (most supported cause)`, ask: GT.overheatQ, intent: 'before_warning', check: (a) => a.facts.topHypothesis === GT.overheatCause },
+    { q: 'Evidence Lab rules out a sensor fault when an independent sensor agrees', fn: (e) => e.investigateWith({}), check: (a) => a.facts.verdicts.sensor === 'ruled out' },
+    { q: GT.leadingQ, intent: 'before_warning', check: (a) => a.facts.leadingRejected === true },
+    { q: 'Missing data: cooling actuator removed, so the cooling claim cannot be verified', fn: (e, d) => e.investigateWith({ drop: [d.profile.overheat.keys.cool] }), check: (a) => a.facts.verdicts.coolingLimit === 'cannot verify' },
+    { q: 'Conflicting sensors: confidence drops and a sensor fault becomes possible', fn: (e) => e.investigateWith({ conflict: true }), check: (a) => a.confidence === 'Low' && a.facts.verdicts.sensor === 'supported' },
+    { q: 'Vehicle memory: similar past episodes are found', ask: GT.overheatQ, intent: 'before_warning', check: (a) => a.facts.similarCount === GT.similarCount },
+    // What-if Lab: replay through a heat model fitted to the recorded incident
+    { q: GT.cfQuestion, intent: 'what_if', check: (a) => a.facts.cfWarn === false && a.facts.cfPeak < a.facts.recordedPeak },
+    { q: 'What-if model reproduces the recorded incident (fit error under 1 °C)', ask: GT.cfQuestion, intent: 'what_if', check: (a) => a.facts.fitRmse < 1 },
+    { q: 'What-if replay is deterministic (same inputs, same result)', fn: (e, d) => { const x = e.ask(GT.cfQuestion), y = e.ask(GT.cfQuestion); return { facts: { same: x.facts.cfPeak === y.facts.cfPeak } }; }, check: (a) => a.facts.same },
     { q: 'Why did the tyre pressure warning come on?', intent: 'before_warning', check: (a) => a.facts.warningCode === GT.tpmsCode && a.facts.topSignal === GT.tpmsTop },
     { q: 'Explain the 12V low voltage warning', intent: 'before_warning', check: (a) => a.facts.abstained === true },
     { q: 'Compare energy consumption between city and highway driving.', intent: 'compare', check: (a) => a.facts.cityKm > 0 && a.facts.highwayKm > 0 },

@@ -16,6 +16,8 @@ const suggestions = () => [
   'When did efficiency show the largest drop?',
   'Show all ADAS disengagement events from yesterday',
   data.GT.overheatQ,
+  data.GT.cfQuestion,
+  data.GT.leadingQ,
   'Compare energy consumption between city and highway driving',
   'range kyun kam ho gayi?',
 ];
@@ -73,7 +75,10 @@ const ROUTE = {
   query: ['Verified query · no LLM', 'r-query'],
   narrate: ['Evidence pack → narrated', 'r-narrate'],
   abstain: ['Not enough data · no guess', 'r-abstain'],
+  investigate: ['Evidence Lab · competing explanations', 'r-narrate'],
+  model: ['What-if Lab · model estimate, not proof', 'r-model'],
 };
+const VERDICT = { supported: 'v-sup', 'ruled out': 'v-out', 'cannot verify': 'v-cant', mixed: 'v-mix' };
 
 function card(a) {
   const [rl, rc] = ROUTE[a.route];
@@ -82,6 +87,11 @@ function card(a) {
   if (a.table && a.table.rows.length) {
     html += `<table><thead><tr>${a.table.cols.map((c) => `<th>${esc(c)}</th>`).join('')}</tr></thead><tbody>${a.table.rows.map((r) => `<tr>${r.map((v) => `<td>${typeof v === 'object' ? `<button class="mini" data-explain="${v.explain}">Explain</button>` : esc(v)}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
   }
+  if (a.hypotheses) {
+    html += `<h4 class="sub">Evidence Lab: competing explanations</h4><table class="hyp"><thead><tr><th>Explanation</th><th>Verdict</th><th>Supporting</th><th>Contradicting / missing</th></tr></thead><tbody>${a.hypotheses.map((h) => `<tr><td><b>${esc(h.label)}</b></td><td><span class="verdict ${VERDICT[h.verdict]}">${esc(h.verdict)}</span></td><td>${h.sup.map(esc).join('<br>') || '–'}</td><td>${[...h.con, ...h.missing].map(esc).join('<br>') || '–'}</td></tr>`).join('')}</tbody></table>`;
+  }
+  if (a.similar && a.similar.length) html += `<h4 class="sub">Vehicle memory: seen before</h4><ul class="mem">${a.similar.map((x) => `<li>${esc(x)}</li>`).join('')}</ul>`;
+  if (a.whatif) html += `<h4 class="sub">What-if Lab: replay this incident with one factor changed</h4><div class="wi">${a.whatif.scenarios.map((sc) => `<button class="chip" data-whatif="${a.whatif.warning}|${sc.id}">${esc(sc.label)}</button>`).join('')}</div>`;
   if (a.evidence) html += `<div class="chips">${a.evidence.map(([v, l]) => `<span class="ev" title="${esc(v)}">${esc(l)}</span>`).join('')}${a.range ? `<span class="ev">${esc(a.range.label)}</span>` : ''}</div>`;
   return html + '</div>';
 }
@@ -106,10 +116,12 @@ function renderSidebar() {
 function runBenchmark() {
   const cases = benchmarkCases(data.GT);
   const rows = cases.map((c) => {
-    const a = engine.ask(c.q);
-    const okIntent = a.intent === c.intent;
+    const t0 = performance.now();
+    let a = null; try { a = c.fn ? c.fn(engine, data) : engine.ask(c.ask || c.q); } catch { a = null; }
+    const ms = (a && a.ms) || performance.now() - t0;
+    const okIntent = !!a && (c.fn ? true : a.intent === c.intent);
     let okAns = false; try { okAns = okIntent && c.check(a); } catch { okAns = false; }
-    return { ...c, got: a.intent, okIntent, okAns, ms: a.ms };
+    return { ...c, intent: c.intent || 'check', got: c.fn ? 'check' : a ? a.intent : 'error', okIntent, okAns, ms };
   });
   const ms = rows.map((r) => r.ms).sort((x, y) => x - y);
   const pct = (p) => ms[Math.min(ms.length - 1, Math.ceil((p / 100) * ms.length) - 1)];
@@ -126,6 +138,7 @@ function init() {
     const b = e.target.closest('button'); if (!b) return;
     if (b.dataset.q) { switchTab('assistant'); ask(b.dataset.q); }
     else if (b.dataset.explain) { switchTab('assistant'); post(engine.explain(b.dataset.explain)); }
+    else if (b.dataset.whatif) { const [w, sc] = b.dataset.whatif.split('|'); post(engine.runWhatIf(w, sc)); }
     else if (b.dataset.tab) switchTab(b.dataset.tab);
     else if (b.id === 'run-bench') runBenchmark();
   });
