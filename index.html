@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Rathi · The car that explains itself</title>
+  <meta name="description" content="Rathi: an offline, on-device vehicle assistant that answers natural-language questions from vehicle data with verified evidence.">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <div class="logo" aria-hidden="true">R</div>
+      <div><h1>Rathi</h1><p>The car that explains itself</p></div>
+    </div>
+    <div class="vsw" role="group" aria-label="Powertrain">
+      <button data-v="ev">Electric</button><button data-v="ice">Petrol</button>
+    </div>
+    <nav>
+      <button data-tab="assistant" class="active">Assistant</button>
+      <button data-tab="bench">Benchmark</button>
+      <button data-tab="how">How it works</button>
+    </nav>
+  </header>
+  <div class="notice">Web preview: simulated vehicle data (28 days, injected faults), running entirely in your browser. One pipeline for any powertrain (electric, petrol, diesel, hybrid) through vehicle profiles mapped to COVESA VSS. The on-device build targets a 2 GB / 2-core ARM board with DuckDB and a 4-bit Qwen 0.5B via llama.cpp.</div>
+
+  <main>
+    <section class="tab" id="tab-assistant">
+      <div class="grid">
+        <div class="chat">
+          <div id="log" aria-live="polite"></div>
+          <div id="chips" class="sugg"></div>
+          <form id="ask"><input id="q" placeholder="Ask about your vehicle… (English or Hindi)" autocomplete="off" aria-label="Question"><button type="submit">Ask</button></form>
+        </div>
+        <aside>
+          <h3>Vehicle snapshot · <span id="vehicle-name"></span></h3><div id="status" class="stats"></div>
+          <h3>Proactive insights</h3><div id="insights"></div>
+          <h3>Warnings</h3><div id="warnings"></div>
+        </aside>
+      </div>
+    </section>
+
+    <section class="tab" id="tab-bench" hidden>
+      <div class="panel">
+        <h2>Self-scoring benchmark</h2>
+        <p>Faults are injected into the simulation, so the correct answer to each question is known in advance. The benchmark asks every question and checks the answer against that ground truth, never against the assistant's own analytics.</p>
+        <button id="run-bench" class="primary">Run benchmark</button>
+        <div id="bench-summary" class="stats wide"></div>
+        <div id="bench-table"></div>
+      </div>
+    </section>
+
+    <section class="tab" id="tab-how" hidden>
+      <div class="panel">
+        <h2>Compute first, talk later</h2>
+        <img src="assets/architecture.png" alt="Rathi architecture: vehicle domain sources flow one way through a read-only data diode into an isolated AI domain with ingestion, event miner, tiered store, intent router and SLM narration." class="arch">
+        <ol class="how">
+          <li><b>Collect:</b> CAN/CAN-FD, SOME/IP, Android VHAL, QNX logs, ADAS events and DTCs are normalised to the COVESA VSS model through a one-way, read-only path.</li>
+          <li><b>Pre-compute:</b> an always-on event miner segments trips, learns this vehicle's own baselines, flags anomalies and keeps snapshots before every warning.</li>
+          <li><b>Retrieve:</b> an intent router sends common questions to verified queries with no LLM in the loop.</li>
+          <li><b>Explain:</b> for "why" questions, a small model narrates a compact evidence pack. Accuracy comes from the analytics, not model size.</li>
+          <li><b>Never guess:</b> every answer shows its evidence and confidence; when data is missing, Rathi says so.</li>
+          <li><b>Any powertrain:</b> the pipeline is the same for electric, petrol, diesel and hybrid cars. A vehicle profile maps each car's signals (battery or engine coolant temperature, Wh/km or L/100 km) onto VSS, so the router, analytics and answers need no changes.</li>
+        </ol>
+        <h3>This preview vs the on-device build</h3>
+        <table><thead><tr><th>Part</th><th>Web preview (now)</th><th>On-device build (in progress)</th></tr></thead><tbody>
+          <tr><td>Data</td><td>Seeded simulation in the browser</td><td>CARLA + fault injection replayed on virtual CAN</td></tr>
+          <tr><td>Storage</td><td>In-memory</td><td>RAM ring buffer → DuckDB → aggregates</td></tr>
+          <tr><td>Router + analytics</td><td>Same logic, in JavaScript</td><td>Python service</td></tr>
+          <tr><td>Narration</td><td>Templates over the evidence pack</td><td>Qwen 0.5B, 4-bit, llama.cpp</td></tr>
+          <tr><td>Hardware</td><td>Your browser</td><td>Raspberry Pi 5 / ARM VM, 2 GB RAM, 2 cores</td></tr>
+        </tbody></table>
+      </div>
+    </section>
+  </main>
+  <footer>Rathi · Tata Elxsi Teliport Season 4 · Case Study 5 (VehicleGPT)</footer>
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
